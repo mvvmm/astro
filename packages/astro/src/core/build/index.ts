@@ -314,6 +314,7 @@ export class AstroBuilder {
 				settings: this.settings,
 				logger: this.logger,
 				previousDist: this.previousDist,
+				depMap: incrementalResult?.depMap,
 			});
 		}
 

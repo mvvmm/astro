@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as devalue from 'devalue';
+import { fromMarkdown } from 'mdast-util-from-markdown';
+import { mdxFromMarkdown } from 'mdast-util-mdx';
+import type { MdxJsxFlowElement, MdxJsxTextElement } from 'mdast-util-mdx-jsx';
+import { mdxjs } from 'micromark-extension-mdxjs';
 import { glob } from 'tinyglobby';
+import { visit } from 'unist-util-visit';
 import xxhash from 'xxhash-wasm';
 import { DATA_STORE_FILE } from '../../content/consts.js';
 import type { DataEntry } from '../../content/data-store.js';
@@ -18,11 +23,24 @@ export interface IncrementalBuildResult {
 	dirtyPathnames: Set<string>;
 	/** Pathnames that were deleted and should NOT be copied from previous dist. */
 	cleanupPathnames: Set<string>;
+	/** Dependency map (if partialResolver was configured). Persisted for next build. */
+	depMap?: DepMap | null;
 }
 
 interface ComponentManifest {
 	[relativePath: string]: string; // hash
 }
+
+interface DepMap {
+	/** partial filePath → doc entry IDs whose pages depend on it (after transitive closure) */
+	partialToPages: Record<string, string[]>;
+	/** partial filePath → other partial filePaths it directly renders */
+	partialToPartials: Record<string, string[]>;
+	/** filePath → digest at time of scanning (for incremental rescan) */
+	scannedDigests: Record<string, string>;
+}
+
+const DEP_MAP_FILE = 'dep-map.json';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -143,7 +161,25 @@ export async function computeDirtyPathnames(opts: {
 		}
 
 		// ---------------------------------------------------------------
-		// 6. Content entry diff
+		// 6. Build dependency map (if partialResolver is configured)
+		// ---------------------------------------------------------------
+		const partialResolver = settings.config.incrementalBuild?.partialResolver as
+			| ((name: string, props: Record<string, string>) => string | null)
+			| undefined;
+		let depMap: DepMap | null = null;
+
+		if (partialResolver) {
+			depMap = await buildDependencyMap({
+				root,
+				currentDataStore,
+				distMetaDir,
+				partialResolver,
+				logger,
+			});
+		}
+
+		// ---------------------------------------------------------------
+		// 7. Content entry diff
 		// ---------------------------------------------------------------
 		const dirtyPathnames = new Set<string>();
 		const cleanupPathnames = new Set<string>();
@@ -154,58 +190,91 @@ export async function computeDirtyPathnames(opts: {
 
 			const prevEntries = prevDataStore.get(collectionName);
 
-			// Only do incremental diffing for the "docs" collection.
-			// For all other collections, if anything changed, trigger full rebuild.
-			if (collectionName !== 'docs') {
-				if (hasCollectionChanged(currentEntries, prevEntries)) {
+			// Handle partials collection via dep map when partialResolver is configured
+			if (collectionName === 'partials' && depMap) {
+				const changedPartialPaths = new Set<string>();
+				// Find changed/new partials
+				for (const [entryId, entry] of currentEntries) {
+					const prevEntry = prevEntries?.get(entryId);
+					if (!prevEntry || entry.digest !== prevEntry.digest) {
+						if (entry.filePath) changedPartialPaths.add(entry.filePath);
+					}
+				}
+				// Find deleted partials
+				if (prevEntries) {
+					for (const [entryId, prevEntry] of prevEntries) {
+						if (!currentEntries.has(entryId) && prevEntry.filePath) {
+							changedPartialPaths.add(prevEntry.filePath);
+						}
+					}
+				}
+				if (changedPartialPaths.size > 0) {
+					// Expand through transitive closure
+					const allAffected = expandTransitive(changedPartialPaths, depMap);
+					for (const partialPath of allAffected) {
+						const pageEntryIds = depMap.partialToPages[partialPath] ?? [];
+						for (const pageEntryId of pageEntryIds) {
+							dirtyPathnames.add(entryIdToPathname(pageEntryId));
+						}
+					}
 					logger.info(
 						'build',
-						`Incremental: collection "${collectionName}" changed — full rebuild.`,
+						`Incremental: ${changedPartialPaths.size} partial(s) changed → ${dirtyPathnames.size} page(s) affected.`,
 					);
-					return null;
 				}
 				continue;
 			}
 
-			// Diff the docs collection entry-by-entry
-			if (!prevEntries) {
-				// Entire collection is new — all entries are dirty
-				for (const [entryId] of currentEntries) {
-					dirtyPathnames.add(entryIdToPathname(entryId));
+			// For docs collection: diff entry-by-entry
+			if (collectionName === 'docs') {
+				if (!prevEntries) {
+					// Entire collection is new — all entries are dirty
+					for (const [entryId] of currentEntries) {
+						dirtyPathnames.add(entryIdToPathname(entryId));
+					}
+					continue;
+				}
+
+				// Check for new/changed entries
+				for (const [entryId, entry] of currentEntries) {
+					const prevEntry = prevEntries.get(entryId);
+					if (!prevEntry) {
+						dirtyPathnames.add(entryIdToPathname(entryId));
+					} else if (entry.digest !== prevEntry.digest) {
+						dirtyPathnames.add(entryIdToPathname(entryId));
+					}
+				}
+
+				// Check for deleted entries
+				for (const [entryId] of prevEntries) {
+					if (!currentEntries.has(entryId)) {
+						cleanupPathnames.add(entryIdToPathname(entryId));
+					}
 				}
 				continue;
 			}
 
-			// Check for new/changed entries
-			for (const [entryId, entry] of currentEntries) {
-				const prevEntry = prevEntries.get(entryId);
-				if (!prevEntry) {
-					// New entry
-					dirtyPathnames.add(entryIdToPathname(entryId));
-				} else if (entry.digest !== prevEntry.digest) {
-					// Changed entry
-					dirtyPathnames.add(entryIdToPathname(entryId));
-				}
-			}
-
-			// Check for deleted entries
-			for (const [entryId] of prevEntries) {
-				if (!currentEntries.has(entryId)) {
-					cleanupPathnames.add(entryIdToPathname(entryId));
-				}
+			// For all other collections: any change triggers full rebuild
+			if (hasCollectionChanged(currentEntries, prevEntries)) {
+				logger.info('build', `Incremental: collection "${collectionName}" changed — full rebuild.`);
+				return null;
 			}
 		}
 
-		// Also check for entirely deleted collections
+		// Check for entirely deleted collections
 		for (const [collectionName] of prevDataStore) {
 			if (collectionName.startsWith('meta:')) continue;
 			if (!currentDataStore.has(collectionName)) {
 				if (collectionName === 'docs') {
-					// All docs deleted — add all previous doc pathnames to cleanup
 					const prevEntries = prevDataStore.get(collectionName)!;
 					for (const [entryId] of prevEntries) {
 						cleanupPathnames.add(entryIdToPathname(entryId));
 					}
+				} else if (collectionName === 'partials' && depMap) {
+					// Partials collection deleted — all pages that used partials are dirty
+					// This is an unusual case; treat as full rebuild for safety
+					logger.info('build', 'Incremental: partials collection deleted — full rebuild.');
+					return null;
 				} else {
 					logger.info(
 						'build',
@@ -216,7 +285,7 @@ export async function computeDirtyPathnames(opts: {
 			}
 		}
 
-		return { dirtyPathnames, cleanupPathnames };
+		return { dirtyPathnames, cleanupPathnames, depMap };
 	} catch (err) {
 		logger.warn('build', `Incremental: error during dirty computation — full rebuild. ${err}`);
 		return null;
@@ -309,8 +378,10 @@ export async function persistBuildMetadata(opts: {
 	settings: AstroSettings;
 	logger: Logger;
 	previousDist?: string;
+	depMap?: DepMap | null;
 }): Promise<void> {
 	const { settings, logger, previousDist } = opts;
+	let { depMap } = opts;
 	const root = fileURLToPath(settings.config.root);
 	const outDirPath = fileURLToPath(settings.config.outDir);
 
@@ -326,7 +397,32 @@ export async function persistBuildMetadata(opts: {
 		return;
 	}
 
-	// 3. Write to all target dist-meta/ directories
+	// 3. Build dep map if partialResolver is configured but no dep map was
+	//    provided (happens on full rebuilds where computeDirtyPathnames
+	//    returned null before building the dep map)
+	const partialResolver = settings.config.incrementalBuild?.partialResolver as
+		| ((name: string, props: Record<string, string>) => string | null)
+		| undefined;
+
+	if (!depMap && partialResolver) {
+		const currentDataStoreRaw = fs.readFileSync(currentDataStorePath, 'utf-8');
+		const currentDataStore: Map<string, Map<string, DataEntry>> = devalue.unflatten(
+			JSON.parse(currentDataStoreRaw),
+		);
+		const distMetaDir = path.join(path.dirname(outDirPath), 'dist-meta');
+		depMap = await buildDependencyMap({
+			root,
+			currentDataStore,
+			distMetaDir,
+			partialResolver,
+			logger,
+		});
+	}
+
+	// 4. Serialize dep map if available
+	const depMapJson = depMap ? JSON.stringify(depMap) : null;
+
+	// 5. Write to all target dist-meta/ directories
 	const distMetaDirs = new Set<string>();
 	distMetaDirs.add(path.join(path.dirname(outDirPath), 'dist-meta'));
 
@@ -339,8 +435,259 @@ export async function persistBuildMetadata(opts: {
 		fs.mkdirSync(distMetaDir, { recursive: true });
 		fs.copyFileSync(currentDataStorePath, path.join(distMetaDir, DATA_STORE_FILE));
 		fs.writeFileSync(path.join(distMetaDir, 'component-manifest.json'), manifestJson);
+		if (depMapJson) {
+			fs.writeFileSync(path.join(distMetaDir, DEP_MAP_FILE), depMapJson);
+		}
 		logger.debug('build', `Incremental: persisted metadata to ${distMetaDir}`);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Dependency map (Phase 2: partial→page reverse map)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a dependency map that records which doc pages depend on which partials.
+ * Uses the user-configured `partialResolver` to interpret JSX nodes in MDX files.
+ *
+ * Loads a cached dep map from dist-meta/ and only re-scans files whose digest
+ * has changed, making subsequent runs fast (~1ms for a 1-file edit).
+ */
+async function buildDependencyMap(opts: {
+	root: string;
+	currentDataStore: Map<string, Map<string, DataEntry>>;
+	distMetaDir: string;
+	partialResolver: (name: string, props: Record<string, string>) => string | null;
+	logger: Logger;
+}): Promise<DepMap> {
+	const { root, currentDataStore, distMetaDir, partialResolver, logger } = opts;
+
+	// Load previous dep map (if it exists)
+	let prevDepMap: DepMap | null = null;
+	const depMapPath = path.join(distMetaDir, DEP_MAP_FILE);
+	if (fs.existsSync(depMapPath)) {
+		try {
+			prevDepMap = JSON.parse(fs.readFileSync(depMapPath, 'utf-8'));
+		} catch {
+			logger.debug('build', 'Incremental: could not parse previous dep-map.json, doing full scan.');
+		}
+	}
+
+	// Collect all MDX files from docs and partials collections with their digests
+	const filesToScan: { filePath: string; digest: string; collection: string; entryId: string }[] =
+		[];
+	for (const collectionName of ['docs', 'partials']) {
+		const entries = currentDataStore.get(collectionName);
+		if (!entries) continue;
+		for (const [entryId, entry] of entries) {
+			if (entry.filePath && entry.filePath.endsWith('.mdx') && entry.digest) {
+				filesToScan.push({
+					filePath: entry.filePath,
+					digest: String(entry.digest),
+					collection: collectionName,
+					entryId,
+				});
+			}
+		}
+	}
+
+	// Forward dep map: filePath → [partialFilePaths it references]
+	const forwardDeps = new Map<string, string[]>();
+	// Track scanned digests for cache
+	const scannedDigests: Record<string, string> = {};
+
+	let rescannedCount = 0;
+	let cachedCount = 0;
+
+	for (const { filePath, digest, collection, entryId } of filesToScan) {
+		scannedDigests[filePath] = digest;
+
+		// Check if we can reuse cached deps for this file
+		if (prevDepMap?.scannedDigests[filePath] === digest) {
+			// Digest unchanged — reconstruct forward deps from the previous dep map
+			const deps: string[] = [];
+			if (collection === 'docs') {
+				// Find which partials this page referenced in the old map
+				for (const [partialPath, pageIds] of Object.entries(prevDepMap.partialToPages)) {
+					if (pageIds.includes(entryId)) {
+						deps.push(partialPath);
+					}
+				}
+			} else if (collection === 'partials') {
+				// Get partial-to-partial deps from old map
+				const p2p = prevDepMap.partialToPartials[filePath];
+				if (p2p) deps.push(...p2p);
+			}
+			if (deps.length > 0) forwardDeps.set(filePath, deps);
+			cachedCount++;
+			continue;
+		}
+
+		// Need to re-scan this file
+		const absPath = path.join(root, filePath);
+		if (!fs.existsSync(absPath)) continue;
+
+		try {
+			const content = fs.readFileSync(absPath, 'utf-8');
+			const deps = scanMdxDependencies(content, partialResolver);
+			if (deps.length > 0) forwardDeps.set(filePath, deps);
+			rescannedCount++;
+		} catch (err) {
+			// Parse error — skip this file (conservative: don't track its deps)
+			logger.debug('build', `Incremental: could not parse ${filePath} for dep scanning: ${err}`);
+			rescannedCount++;
+		}
+	}
+
+	logger.info(
+		'build',
+		`Incremental: dep map — scanned ${rescannedCount} file(s), reused cache for ${cachedCount}.`,
+	);
+
+	// Build reverse maps from forward deps
+	const directPartialToPages: Record<string, Set<string>> = {};
+	const partialToPartials: Record<string, string[]> = {};
+
+	for (const { filePath, collection, entryId } of filesToScan) {
+		const deps = forwardDeps.get(filePath);
+		if (!deps) continue;
+
+		if (collection === 'docs') {
+			// This is a doc page → its deps are partial file paths
+			for (const partialPath of deps) {
+				if (!directPartialToPages[partialPath]) {
+					directPartialToPages[partialPath] = new Set();
+				}
+				directPartialToPages[partialPath].add(entryId);
+			}
+		} else if (collection === 'partials') {
+			// This is a partial → its deps are other partial file paths
+			partialToPartials[filePath] = deps;
+		}
+	}
+
+	// Compute transitive closure for partial-to-partial deps:
+	// If partial A renders partial B, then all pages using A should also be
+	// in B's page set (because if B changes, pages using A need rebuilding too).
+	//
+	// For each partial that has parent partials (is rendered by another partial),
+	// propagate its direct pages upward through the chain.
+	const finalPartialToPages: Record<string, string[]> = {};
+
+	// Start with direct page mappings
+	for (const [partialPath, pageSet] of Object.entries(directPartialToPages)) {
+		finalPartialToPages[partialPath] = [...pageSet];
+	}
+
+	// Build reverse of partialToPartials: child → parents that render it
+	const renderedBy = new Map<string, Set<string>>();
+	for (const [parent, children] of Object.entries(partialToPartials)) {
+		for (const child of children) {
+			if (!renderedBy.has(child)) renderedBy.set(child, new Set());
+			renderedBy.get(child)!.add(parent);
+		}
+	}
+
+	// For each partial with direct pages, propagate pages to all ancestor partials
+	for (const [partialPath, pages] of Object.entries(directPartialToPages)) {
+		// BFS upward through rendering chain
+		const visited = new Set<string>([partialPath]);
+		const queue = [partialPath];
+		while (queue.length > 0) {
+			const current = queue.shift()!;
+			const parents = renderedBy.get(current);
+			if (!parents) continue;
+			for (const parent of parents) {
+				if (visited.has(parent)) continue;
+				visited.add(parent);
+				queue.push(parent);
+				// Parent partial also serves these pages
+				if (!finalPartialToPages[parent]) {
+					finalPartialToPages[parent] = [];
+				}
+				for (const page of pages) {
+					if (!finalPartialToPages[parent].includes(page)) {
+						finalPartialToPages[parent].push(page);
+					}
+				}
+			}
+		}
+	}
+
+	return {
+		partialToPages: finalPartialToPages,
+		partialToPartials,
+		scannedDigests,
+	};
+}
+
+/**
+ * Parse an MDX file and extract the partial file paths it depends on
+ * by visiting JSX nodes and calling the partialResolver callback.
+ */
+function scanMdxDependencies(
+	content: string,
+	partialResolver: (name: string, props: Record<string, string>) => string | null,
+): string[] {
+	const deps: string[] = [];
+
+	const tree = fromMarkdown(content, {
+		extensions: [mdxjs()],
+		mdastExtensions: [mdxFromMarkdown()],
+	});
+
+	visit(tree, ['mdxJsxFlowElement', 'mdxJsxTextElement'], (node) => {
+		const jsxNode = node as MdxJsxFlowElement | MdxJsxTextElement;
+		if (!jsxNode.name) return;
+
+		// Extract literal string attributes into a props Record
+		const props: Record<string, string> = {};
+		for (const attr of jsxNode.attributes) {
+			if (attr.type === 'mdxJsxAttribute' && typeof attr.value === 'string') {
+				props[attr.name] = attr.value;
+			}
+		}
+
+		const resolved = partialResolver(jsxNode.name, props);
+		if (resolved && !deps.includes(resolved)) {
+			deps.push(resolved);
+		}
+	});
+
+	return deps;
+}
+
+/**
+ * Expand a set of changed partial file paths through the transitive
+ * dependency graph. Returns all partials that are affected (directly
+ * changed + any partial that renders an affected partial).
+ */
+function expandTransitive(changedPartials: Set<string>, depMap: DepMap): Set<string> {
+	// Build reverse map: partial → partials that render it
+	const renderedBy = new Map<string, Set<string>>();
+	for (const [parent, children] of Object.entries(depMap.partialToPartials)) {
+		for (const child of children) {
+			if (!renderedBy.has(child)) renderedBy.set(child, new Set());
+			renderedBy.get(child)!.add(parent);
+		}
+	}
+
+	// BFS upward from changed partials
+	const visited = new Set(changedPartials);
+	const queue = [...changedPartials];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		const parents = renderedBy.get(current);
+		if (!parents) continue;
+		for (const parent of parents) {
+			if (!visited.has(parent)) {
+				visited.add(parent);
+				queue.push(parent);
+			}
+		}
+	}
+
+	return visited;
 }
 
 // ---------------------------------------------------------------------------
