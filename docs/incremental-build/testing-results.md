@@ -1,13 +1,13 @@
-# Phase 1 Testing Results
+# Testing Results
 
 **Date**: 2026-03-21
-**Tested against**: cloudflare-docs (~6,080 MDX doc pages, ~8,875 total data store entries)
+**Tested against**: cloudflare-docs (~6,080 MDX doc pages, ~1,382 partials, ~8,875 total data store entries)
 
 ---
 
 ## Test Environment
 
-- Astro fork with incremental build support (Phase 1)
+- Astro fork with incremental build support (Phase 1 + Phase 2)
 - cloudflare-docs at `/Users/vance/code/cloudflare/cloudflare-docs`
 - Node.js with `--max-old-space-size=8192`
 - macOS (local development machine)
@@ -104,3 +104,142 @@ The full cloudflare-docs build (all 6,080 pages rendered) takes significantly lo
 | Zero-change build produces 0 dirty pages      | Pass             |
 | Non-content file change triggers full rebuild | Pass (by design) |
 | Missing `dist-meta/` triggers full rebuild    | Pass             |
+
+---
+
+# Phase 2 Testing Results (Partial Dependency Graph)
+
+**Date**: 2026-03-21
+
+## Configuration
+
+cloudflare-docs `astro.config.ts` was updated with:
+
+```ts
+incrementalBuild: {
+  partialResolver: (name, props) => {
+    if (name === "Render" && props.file && props.product) {
+      return `src/content/partials/${props.product}/${props.file}.mdx`;
+    }
+    return null;
+  },
+},
+```
+
+---
+
+## Dep Map Statistics
+
+| Metric                                                 | Value |
+| ------------------------------------------------------ | ----- |
+| Total MDX files scanned                                | 7,397 |
+| Partials with at least one consuming page              | 1,329 |
+| Partials that render other partials (transitive edges) | 116   |
+| `dep-map.json` file size                               | ~1 MB |
+| First scan time (no cache)                             | ~4s   |
+| Subsequent scan time (1 file changed)                  | ~0s   |
+
+---
+
+## Test 3: Single Partial Changed
+
+**Command**: `astro build --previous-dist ./build/cache/dist`
+
+Edited `src/content/partials/workers/prereqs.mdx` (used by 33 pages).
+
+**Results**:
+
+- Dep map: **scanned 1 file**, reused cache for 7,396
+- Detected: **1 partial changed → 33 pages affected**
+- Rebuilt **33 pages** (not 6,080)
+- Copied **7,326 clean pages** from cache (skipped 33 dirty)
+- Total build time: **~141s**
+
+### Key log output
+
+```
+Incremental: dep map — scanned 1 file(s), reused cache for 7396.
+Incremental: 1 partial(s) changed → 33 page(s) affected.
+Incremental build: 33 page(s) to rebuild
+Incremental: copied 7326 clean pages from previous build (skipped 33 dirty/deleted).
+33 page(s) built in 140.87s
+```
+
+---
+
+## Test 4: Zero Changes (With Dep Map)
+
+**Command**: `astro build --previous-dist ./build/cache/dist`
+
+No changes after a prior incremental build that generated the dep map.
+
+**Results**:
+
+- Dep map: scanned 0 files, reused cache for 7,397
+- Detected **0 dirty pages**
+- Copied **7,359 clean pages** from cache
+- Total build time: **~143s**
+
+---
+
+## Phase 2 Build Time Breakdown (33 Dirty Pages from Partial Change)
+
+| Phase                              | Time      | Notes                                               |
+| ---------------------------------- | --------- | --------------------------------------------------- |
+| Content sync                       | ~1s       | Skips unchanged entries via digest comparison       |
+| Dirty computation + dep map        | ~4s       | Data store diff + dep map lookup (1 file rescanned) |
+| Vite bundling (prerender + client) | ~106s     | Still processes all routes                          |
+| Page rendering                     | ~15s      | 33 pages instead of 6,080                           |
+| Copy clean pages                   | ~4s       | 7,326 HTML files copied from cache                  |
+| Hooks (sitemap, lastmod, etc.)     | ~4s       | Sitemap scans complete dist/                        |
+| **Total**                          | **~141s** |                                                     |
+
+---
+
+## Phase 1 vs Phase 2 Comparison
+
+| Scenario                      | Phase 1 behavior         | Phase 2 behavior            |
+| ----------------------------- | ------------------------ | --------------------------- |
+| 1 docs page changed           | Rebuild 1 page           | Rebuild 1 page (unchanged)  |
+| 1 partial changed (33 users)  | **Full rebuild (6,080)** | **Rebuild 33 pages**        |
+| Non-content src/ file changed | Full rebuild             | Full rebuild (unchanged)    |
+| astro.config changed          | Full rebuild             | Full rebuild (unchanged)    |
+| Zero changes                  | 0 pages rebuilt          | 0 pages rebuilt (unchanged) |
+
+---
+
+## Dep Map Caching Behavior
+
+| Scenario                     | Files re-scanned | Files reused from cache |
+| ---------------------------- | ---------------- | ----------------------- |
+| First build (no prior cache) | 7,397            | 0                       |
+| No changes                   | 0                | 7,397                   |
+| 1 partial changed            | 1                | 7,396                   |
+| 1 docs page changed          | 1                | 7,396                   |
+| Full rebuild (config change) | 7,397            | 0                       |
+
+---
+
+## Transitive Dependency Verification
+
+The dep map correctly tracks partial-to-partial chains. With 116 partials rendering other partials, the transitive closure ensures that if partial B changes and partial A renders B, all pages using A are also marked dirty.
+
+Example from the dep map:
+
+- `src/content/partials/workers/prereqs.mdx` is directly used by 33 doc pages
+- Some of those usages are via intermediate partials (partial chains)
+- The `expandTransitive()` BFS correctly propagates through these chains
+
+---
+
+## Correctness Verification (Phase 2)
+
+| Check                                                     | Result |
+| --------------------------------------------------------- | ------ |
+| Partial change rebuilds only affected pages               | Pass   |
+| Dep map persisted to both dist-meta/ locations            | Pass   |
+| Dep map caching skips unchanged files                     | Pass   |
+| Dep map built even on full rebuilds (for next run)        | Pass   |
+| Transitive partial deps expanded correctly                | Pass   |
+| Zero-change build with dep map: 0 dirty pages             | Pass   |
+| Non-partial collection change still triggers full rebuild | Pass   |
