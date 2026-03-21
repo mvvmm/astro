@@ -84,6 +84,7 @@ export default async function build(
 		logger,
 		mode: inlineConfig.mode ?? 'production',
 		runtimeMode: options.devOutput ? 'development' : 'production',
+		previousDist: inlineConfig.previousDist,
 	});
 	await builder.run();
 }
@@ -102,6 +103,10 @@ interface AstroBuilderOptions extends BuildOptions {
 	 * Set to false for in-memory builds that don't need type generation.
 	 */
 	sync?: boolean;
+	/**
+	 * Path to a previous build's dist/ directory for incremental builds.
+	 */
+	previousDist?: string;
 }
 
 export class AstroBuilder {
@@ -114,6 +119,7 @@ export class AstroBuilder {
 	private timer: Record<string, number>;
 	private teardownCompiler: boolean;
 	private sync: boolean;
+	private previousDist: string | undefined;
 
 	constructor(settings: AstroSettings, options: AstroBuilderOptions) {
 		this.mode = options.mode;
@@ -122,6 +128,7 @@ export class AstroBuilder {
 		this.logger = options.logger;
 		this.teardownCompiler = options.teardownCompiler ?? true;
 		this.sync = options.sync ?? true;
+		this.previousDist = options.previousDist;
 		this.origin = settings.config.site
 			? new URL(settings.config.site).origin
 			: `http://localhost:${settings.config.server.port}`;
@@ -212,6 +219,52 @@ export class AstroBuilder {
 		// The names of each pages
 		const pageNames: string[] = [];
 
+		// ---------------------------------------------------------------
+		// Incremental build: compute dirty pages and inject prerenderer
+		// ---------------------------------------------------------------
+		let incrementalResult: import('./incremental.js').IncrementalBuildResult | null = null;
+
+		if (this.previousDist) {
+			const { computeDirtyPathnames } = await import('./incremental.js');
+			incrementalResult = await computeDirtyPathnames({
+				settings: this.settings,
+				routesList: this.routesList,
+				logger: this.logger,
+				previousDist: this.previousDist,
+			});
+
+			if (incrementalResult !== null) {
+				this.logger.info(
+					'build',
+					colors.green(
+						`Incremental build: ${incrementalResult.dirtyPathnames.size} page(s) to rebuild` +
+							(incrementalResult.cleanupPathnames.size > 0
+								? `, ${incrementalResult.cleanupPathnames.size} to remove`
+								: ''),
+					),
+				);
+
+				// Wrap the prerenderer to filter getStaticPaths() to dirty pathnames only
+				const existingPrerenderer = this.settings.prerenderer;
+				const dirtyPathnames = incrementalResult.dirtyPathnames;
+				this.settings.prerenderer = (defaultPrerenderer) => {
+					const base =
+						typeof existingPrerenderer === 'function'
+							? existingPrerenderer(defaultPrerenderer)
+							: (existingPrerenderer ?? defaultPrerenderer);
+					return {
+						...base,
+						async getStaticPaths() {
+							const all = await base.getStaticPaths();
+							return all.filter(({ pathname }) => dirtyPathnames.has(pathname));
+						},
+					};
+				};
+			} else {
+				this.logger.info('build', 'Incremental build: full rebuild required.');
+			}
+		}
+
 		// Bundle the assets in your final build: This currently takes the HTML output
 		// of every page (stored in memory) and bundles the assets pointed to on those pages.
 		this.timer.buildStart = performance.now();
@@ -237,6 +290,32 @@ export class AstroBuilder {
 		};
 
 		await viteBuild(opts);
+
+		// ---------------------------------------------------------------
+		// Incremental build: copy clean pages from previous dist
+		// ---------------------------------------------------------------
+		if (this.previousDist && incrementalResult !== null) {
+			const { copyCleanPages } = await import('./incremental.js');
+			await copyCleanPages({
+				previousDist: this.previousDist,
+				outDir: this.settings.config.outDir,
+				result: incrementalResult,
+				logger: this.logger,
+				settings: this.settings,
+			});
+		}
+
+		// ---------------------------------------------------------------
+		// Persist build metadata for future incremental builds
+		// ---------------------------------------------------------------
+		{
+			const { persistBuildMetadata } = await import('./incremental.js');
+			await persistBuildMetadata({
+				settings: this.settings,
+				logger: this.logger,
+				previousDist: this.previousDist,
+			});
+		}
 
 		// Write any additionally generated assets to disk.
 		this.timer.assetsStart = performance.now();

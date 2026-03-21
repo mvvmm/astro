@@ -23,6 +23,7 @@ export async function build({ flags }: BuildOptions) {
 						'--force',
 						'Clear the content layer and content collection cache, forcing a full rebuild.',
 					],
+					['--previous-dist <path>', 'Path to a prior build output for incremental rebuild.'],
 					['--help (-h)', 'See all available flags.'],
 				],
 			},
