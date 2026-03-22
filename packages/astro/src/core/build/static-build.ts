@@ -217,16 +217,18 @@ async function buildEnvironments(opts: StaticBuildOptions, internals: BuildInter
 					await ssrMoveAssets(opts, internals, prerenderOutputDir);
 					// Generate the pages
 					await generatePages(opts, internals, prerenderOutputDir);
-					// Clean up prerender directory after generation
-					await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
+					// Defer cleanup of prerender directory — index.ts will clean it up
+					// after persistBuildMetadata caches the prerender bundle.
+					// await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
 					settings.timer.end('Static generate');
 				} else if (settings.buildOutput === 'server') {
 					settings.timer.start('Server generate');
 					await generatePages(opts, internals, prerenderOutputDir);
 					// Move prerender and SSR assets to client directory before cleaning up
 					await ssrMoveAssets(opts, internals, prerenderOutputDir);
-					// Clean up prerender directory after generation
-					await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
+					// Defer cleanup of prerender directory — index.ts will clean it up
+					// after persistBuildMetadata caches the prerender bundle.
+					// await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
 					settings.timer.end('Server generate');
 				}
 			},
@@ -556,7 +558,7 @@ async function writeMutatedChunks(
  * Reads asset filenames from internals.ssrAssetsPerEnvironment which is populated
  * by vitePluginSSRAssets during the build.
  */
-async function ssrMoveAssets(
+export async function ssrMoveAssets(
 	opts: StaticBuildOptions,
 	internals: BuildInternals,
 	prerenderOutputDir: URL,

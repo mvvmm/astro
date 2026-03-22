@@ -243,3 +243,109 @@ Example from the dep map:
 | Transitive partial deps expanded correctly                | Pass   |
 | Zero-change build with dep map: 0 dirty pages             | Pass   |
 | Non-partial collection change still triggers full rebuild | Pass   |
+
+---
+
+# Phase 3 Testing Results (Skip Vite Build)
+
+**Date**: 2026-03-21
+
+## What Changed
+
+When `computeDirtyPathnames()` returns non-null (content-only changes detected, no source file changes), the entire Vite bundling phase (~106s) is skipped. Instead:
+
+1. BuildInternals is restored from `dist-meta/build-internals.json`
+2. Prerender bundle + client chunks are copied from `dist-meta/.prerender/` and `previousDist/_astro/`
+3. `ssrMoveAssets()` and `generatePages()` run directly with the restored internals
+
+---
+
+## Test 5: Zero Changes (Skip Vite)
+
+**Command**: `astro build --previous-dist ./build/cache/dist`
+
+No source or content files changed. Vite build skipped.
+
+**Results**:
+
+- Detected **0 dirty pages**
+- **Skipped Vite build** (content-only change)
+- Copied **7,359 clean pages** from cache
+- Total build time: **~21s**
+
+### Key log output
+
+```
+Incremental: dep map — scanned 0 file(s), reused cache for 7397.
+Incremental build: 0 page(s) to rebuild
+Incremental: skipped Vite build (content-only change).
+Incremental: copied 7359 clean pages from previous build (skipped 0 dirty/deleted).
+0 page(s) built in 20.65s
+```
+
+---
+
+## Test 6: One Page Changed (Skip Vite)
+
+**Command**: `astro build --previous-dist ./build/cache/dist`
+
+Edited `src/content/docs/workers/get-started/guide.mdx`. Vite build skipped.
+
+**Results**:
+
+- Detected **1 dirty page**
+- **Skipped Vite build** (content-only change)
+- Rebuilt `/workers/get-started/guide/index.html` (282ms)
+- Copied **7,358 clean pages** from cache
+- Total build time: **~19s**
+
+---
+
+## Performance Comparison Across All Phases
+
+| Scenario             | Phase 1      | Phase 2      | Phase 3      | Improvement |
+| -------------------- | ------------ | ------------ | ------------ | ----------- |
+| 0 pages changed      | ~138s        | ~143s        | **~21s**     | 6.6x faster |
+| 1 doc page changed   | ~130s        | ~130s        | **~19s**     | 6.8x faster |
+| 1 partial (33 pages) | Full rebuild | ~141s        | **~25-30s**  | ~5x faster  |
+| Source file changed  | Full rebuild | Full rebuild | Full rebuild | (no change) |
+
+### Where the Time Goes (Phase 3, 1 Page Changed)
+
+| Phase                    | Time     | Notes                                  |
+| ------------------------ | -------- | -------------------------------------- |
+| Content sync             | ~1s      |                                        |
+| Dirty computation        | ~4s      | Data store diff + dep map              |
+| Restore internals + copy | ~6s      | Deserialize JSON + copy \_astro/ files |
+| ssrMoveAssets            | ~1s      | Move assets from .prerender/           |
+| Page rendering           | ~1s      | 1 page                                 |
+| Copy clean pages         | ~4s      | 7,358 HTML files                       |
+| Hooks (sitemap, etc.)    | ~4s      |                                        |
+| **Total**                | **~19s** |                                        |
+
+---
+
+## Fallback Behavior
+
+| Scenario                                      | Result                                              |
+| --------------------------------------------- | --------------------------------------------------- |
+| `build-internals.json` missing                | Falls back to full Vite build (with warning)        |
+| `.prerender/` cache missing                   | Falls back to full Vite build (with warning)        |
+| `build-internals.json` version mismatch       | Falls back to full Vite build (error caught)        |
+| Source file changed (component, layout, etc.) | Full Vite build (Phase 1 conservative check)        |
+| First run after schema change                 | Full Vite build (generates all caches for next run) |
+
+---
+
+## Correctness Verification (Phase 3)
+
+| Check                                                | Result |
+| ---------------------------------------------------- | ------ |
+| Vite build skipped when only content changed         | Pass   |
+| Page rendered correctly without Vite build           | Pass   |
+| Clean pages copied correctly                         | Pass   |
+| Prerender bundle cached to dist-meta/ for next build | Pass   |
+| BuildInternals serialization/restoration roundtrip   | Pass   |
+| Fallback to full build on missing cache              | Pass   |
+| Fallback to full build on source file change         | Pass   |
+| Sitemap generated correctly after Vite skip          | Pass   |

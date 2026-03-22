@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import colors from 'piccolore';
@@ -289,7 +290,71 @@ export class AstroBuilder {
 			key: keyPromise,
 		};
 
-		await viteBuild(opts);
+		// ---------------------------------------------------------------
+		// Phase 3: Skip Vite build for content-only changes
+		// ---------------------------------------------------------------
+		let viteBuildInternals: import('./internal.js').BuildInternals | null = null;
+		let skippedViteBuild = false;
+
+		if (this.previousDist && incrementalResult !== null) {
+			// Content-only change — try to skip the Vite build
+			const incremental = await import('./incremental.js');
+			const root = fileURLToPath(this.settings.config.root);
+			const previousDistAbs = path.resolve(root, this.previousDist);
+			const distMetaDir = path.join(path.dirname(previousDistAbs), 'dist-meta');
+			const internalsPath = path.join(distMetaDir, 'build-internals.json');
+
+			if (fs.existsSync(internalsPath)) {
+				try {
+					const internalsJson = fs.readFileSync(internalsPath, 'utf-8');
+					viteBuildInternals = await incremental.restoreBuildInternals(internalsJson);
+
+					// Empty outDir (normally done inside viteBuild)
+					if (this.settings.config?.vite?.build?.emptyOutDir !== false) {
+						const { emptyDir } = await import('../fs/index.js');
+						emptyDir(this.settings.config.outDir, new Set('.git'));
+					}
+
+					// Copy build artifacts from previous build
+					await incremental.copyBuildArtifacts({
+						previousDist: this.previousDist,
+						settings: this.settings,
+						logger: this.logger,
+					});
+
+					// Run the post-build steps that normally happen inside viteBuild:
+					// 1. ssrMoveAssets
+					// 2. generatePages (with prerenderer filter for dirty pages)
+					// 3. Clean up prerender dir
+					const { getPrerenderOutputDirectory } = await import('../../prerender/utils.js');
+					const { ssrMoveAssets } = await import('./static-build.js');
+					const { generatePages } = await import('./generate.js');
+					const prerenderOutputDir = getPrerenderOutputDirectory(this.settings);
+
+					this.logger.info('build', 'Rearranging server assets...');
+					await ssrMoveAssets(opts, viteBuildInternals, prerenderOutputDir);
+					await generatePages(opts, viteBuildInternals, prerenderOutputDir);
+					await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
+
+					skippedViteBuild = true;
+					this.logger.info(
+						'build',
+						colors.green('Incremental: skipped Vite build (content-only change).'),
+					);
+				} catch (err) {
+					this.logger.warn(
+						'build',
+						`Incremental: failed to skip Vite build, falling back to full build. ${err}`,
+					);
+					viteBuildInternals = null;
+				}
+			}
+		}
+
+		if (!skippedViteBuild) {
+			const result = await viteBuild(opts);
+			viteBuildInternals = result.internals;
+		}
 
 		// ---------------------------------------------------------------
 		// Incremental build: copy clean pages from previous dist
@@ -315,7 +380,16 @@ export class AstroBuilder {
 				logger: this.logger,
 				previousDist: this.previousDist,
 				depMap: incrementalResult?.depMap,
+				internals: viteBuildInternals,
 			});
+		}
+
+		// Clean up the prerender directory (deferred from viteBuild to allow
+		// persistBuildMetadata to cache it first)
+		if (!skippedViteBuild) {
+			const { getPrerenderOutputDirectory } = await import('../../prerender/utils.js');
+			const prerenderOutputDir = getPrerenderOutputDirectory(this.settings);
+			await fs.promises.rm(prerenderOutputDir, { recursive: true, force: true });
 		}
 
 		// Write any additionally generated assets to disk.

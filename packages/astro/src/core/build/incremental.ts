@@ -379,8 +379,9 @@ export async function persistBuildMetadata(opts: {
 	logger: Logger;
 	previousDist?: string;
 	depMap?: DepMap | null;
+	internals?: import('./internal.js').BuildInternals | null;
 }): Promise<void> {
-	const { settings, logger, previousDist } = opts;
+	const { settings, logger, previousDist, internals } = opts;
 	let { depMap } = opts;
 	const root = fileURLToPath(settings.config.root);
 	const outDirPath = fileURLToPath(settings.config.outDir);
@@ -422,7 +423,10 @@ export async function persistBuildMetadata(opts: {
 	// 4. Serialize dep map if available
 	const depMapJson = depMap ? JSON.stringify(depMap) : null;
 
-	// 5. Write to all target dist-meta/ directories
+	// 5. Serialize build internals if available (for Phase 3 Vite skip)
+	const internalsJson = internals ? serializeBuildInternals(internals) : null;
+
+	// 6. Write to all target dist-meta/ directories
 	const distMetaDirs = new Set<string>();
 	distMetaDirs.add(path.join(path.dirname(outDirPath), 'dist-meta'));
 
@@ -438,7 +442,231 @@ export async function persistBuildMetadata(opts: {
 		if (depMapJson) {
 			fs.writeFileSync(path.join(distMetaDir, DEP_MAP_FILE), depMapJson);
 		}
+		if (internalsJson) {
+			fs.writeFileSync(path.join(distMetaDir, BUILD_INTERNALS_FILE), internalsJson);
+		}
+
+		// Cache the prerender bundle so the next incremental build can reuse it
+		// (the original .prerender/ dir is deleted after persistBuildMetadata)
+		// For static builds, prerender dir is at outDir/.prerender/
+		const prerenderDir = path.join(outDirPath, '.prerender');
+		const cachedPrerenderDir = path.join(distMetaDir, '.prerender');
+		if (fs.existsSync(prerenderDir)) {
+			// Remove old cached prerender dir if it exists
+			if (fs.existsSync(cachedPrerenderDir)) {
+				fs.rmSync(cachedPrerenderDir, { recursive: true, force: true });
+			}
+			copyDirSync(prerenderDir, cachedPrerenderDir);
+		}
+
 		logger.debug('build', `Incremental: persisted metadata to ${distMetaDir}`);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Skip Vite build — BuildInternals serialization
+// ---------------------------------------------------------------------------
+
+const BUILD_INTERNALS_FILE = 'build-internals.json';
+
+/**
+ * Serialize the subset of BuildInternals needed by generatePages() and
+ * ssrMoveAssets() into a JSON-safe object for disk persistence.
+ */
+export function serializeBuildInternals(internals: import('./internal.js').BuildInternals): string {
+	const data = {
+		version: 1,
+		pagesByKeys: [...internals.pagesByKeys.entries()].map(([key, page]) => [
+			key,
+			{
+				key: page.key,
+				component: page.component,
+				route: serializeRouteData(page.route),
+				moduleSpecifier: page.moduleSpecifier,
+				styles: page.styles,
+			},
+		]),
+		prerenderEntryFileName: internals.prerenderEntryFileName,
+		entrySpecifierToBundleMap: [...internals.entrySpecifierToBundleMap.entries()],
+		ssrAssetsPerEnvironment: [...internals.ssrAssetsPerEnvironment.entries()].map(
+			([envName, assets]) => [envName, [...assets]],
+		),
+	};
+	return JSON.stringify(data);
+}
+
+/**
+ * Restore a BuildInternals object from serialized JSON. Only the fields
+ * needed by generatePages() and ssrMoveAssets() are populated.
+ */
+export async function restoreBuildInternals(
+	json: string,
+): Promise<import('./internal.js').BuildInternals> {
+	const { createBuildInternals } = await import('./internal.js');
+	const data = JSON.parse(json);
+
+	if (data.version !== 1) {
+		throw new Error(`Unsupported build-internals.json version: ${data.version}`);
+	}
+
+	const internals = createBuildInternals() as import('./internal.js').BuildInternals;
+
+	internals.pagesByKeys = new Map(
+		data.pagesByKeys.map(([key, page]: [string, any]) => [
+			key,
+			{
+				key: page.key,
+				component: page.component,
+				route: deserializeRouteData(page.route),
+				moduleSpecifier: page.moduleSpecifier,
+				styles: page.styles,
+			},
+		]),
+	);
+
+	internals.prerenderEntryFileName = data.prerenderEntryFileName;
+
+	internals.entrySpecifierToBundleMap = new Map(data.entrySpecifierToBundleMap);
+
+	internals.ssrAssetsPerEnvironment = new Map(
+		data.ssrAssetsPerEnvironment.map(([envName, assets]: [string, string[]]) => [
+			envName,
+			new Set(assets),
+		]),
+	);
+
+	return internals;
+}
+
+/**
+ * Copy the Vite build artifacts from the previous build so that
+ * generatePages() can load the prerender bundle and reference client chunks.
+ *
+ * Copies:
+ * - .prerender/ directory (prerender entry bundle + chunks)
+ * - _astro/ directory (client CSS/JS chunks)
+ * - public/ files (copied by Vite's client build normally)
+ */
+export async function copyBuildArtifacts(opts: {
+	previousDist: string;
+	settings: AstroSettings;
+	logger: Logger;
+}): Promise<void> {
+	const { previousDist, settings, logger } = opts;
+	const root = fileURLToPath(settings.config.root);
+	const previousDistAbs = path.resolve(root, previousDist);
+	const outDirPath = fileURLToPath(settings.config.outDir);
+
+	// 1. Copy prerender bundle from the previous build's prerender output dir
+	//    For static builds, prerender dir is at outDir/.prerender/ (inside dist/)
+	const prerenderDirName = '.prerender';
+	const prevPrerenderDir = path.join(previousDistAbs, prerenderDirName);
+	const currPrerenderDir = path.join(outDirPath, prerenderDirName);
+
+	if (fs.existsSync(prevPrerenderDir)) {
+		copyDirSync(prevPrerenderDir, currPrerenderDir);
+		logger.debug('build', `Incremental: copied prerender bundle from ${prevPrerenderDir}`);
+	} else {
+		// The prerender dir is cleaned up after each build. Check the dist-meta/ cache.
+		const distMetaDir = path.join(path.dirname(previousDistAbs), 'dist-meta');
+		const cachedPrerenderDir = path.join(distMetaDir, prerenderDirName);
+		if (fs.existsSync(cachedPrerenderDir)) {
+			copyDirSync(cachedPrerenderDir, currPrerenderDir);
+			logger.debug('build', `Incremental: copied prerender bundle from ${cachedPrerenderDir}`);
+		} else {
+			throw new Error(
+				'Incremental: prerender bundle not found. Cannot skip Vite build. ' +
+					`Searched: ${prevPrerenderDir}, ${cachedPrerenderDir}`,
+			);
+		}
+	}
+
+	// 2. Copy client assets (_astro/) from previous dist
+	const assetsDir = settings.config.build.assets; // default: "_astro"
+	const prevAssetsDir = path.join(previousDistAbs, assetsDir);
+	const currAssetsDir = path.join(outDirPath, assetsDir);
+	if (fs.existsSync(prevAssetsDir)) {
+		copyDirSync(prevAssetsDir, currAssetsDir);
+		logger.debug('build', `Incremental: copied client assets from ${prevAssetsDir}`);
+	}
+
+	// 3. Copy public/ files from previous dist (non-HTML, non-_astro)
+	// These are files that Vite normally copies from public/ during the client build.
+	// We only copy non-HTML files since HTML pages are handled separately.
+	if (fs.existsSync(previousDistAbs)) {
+		const entries = fs.readdirSync(previousDistAbs, { withFileTypes: true });
+		for (const entry of entries) {
+			// Skip _astro (already copied), HTML files, and sitemap/robots (regenerated)
+			if (entry.name === assetsDir) continue;
+			if (entry.name.endsWith('.html')) continue;
+			if (/^sitemap.*\.xml$/.test(entry.name)) continue;
+			if (entry.name === 'robots.txt') continue;
+
+			const src = path.join(previousDistAbs, entry.name);
+			const dest = path.join(outDirPath, entry.name);
+
+			if (entry.isDirectory()) {
+				// Only copy non-page directories (like favicon, images, etc.)
+				// Page directories contain HTML which is handled by generatePages + copyCleanPages
+				// We'll copy the directory but only non-HTML files from it
+				copyDirSyncExcludeHtml(src, dest);
+			} else {
+				fs.mkdirSync(path.dirname(dest), { recursive: true });
+				fs.copyFileSync(src, dest);
+			}
+		}
+	}
+}
+
+/** Serialize a RouteData object (handles RegExp and URL fields). */
+function serializeRouteData(route: any): any {
+	return {
+		...route,
+		pattern: { source: route.pattern.source, flags: route.pattern.flags },
+		distURL: (route.distURL ?? []).map((u: URL) => u.href),
+		redirectRoute: route.redirectRoute ? serializeRouteData(route.redirectRoute) : undefined,
+		fallbackRoutes: (route.fallbackRoutes ?? []).map(serializeRouteData),
+	};
+}
+
+/** Deserialize a RouteData object (reconstructs RegExp and URL). */
+function deserializeRouteData(data: any): any {
+	return {
+		...data,
+		pattern: new RegExp(data.pattern.source, data.pattern.flags),
+		distURL: (data.distURL ?? []).map((href: string) => new URL(href)),
+		redirectRoute: data.redirectRoute ? deserializeRouteData(data.redirectRoute) : undefined,
+		fallbackRoutes: (data.fallbackRoutes ?? []).map(deserializeRouteData),
+	};
+}
+
+/** Recursively copy a directory. */
+function copyDirSync(src: string, dest: string): void {
+	fs.mkdirSync(dest, { recursive: true });
+	const entries = fs.readdirSync(src, { withFileTypes: true });
+	for (const entry of entries) {
+		const srcPath = path.join(src, entry.name);
+		const destPath = path.join(dest, entry.name);
+		if (entry.isDirectory()) {
+			copyDirSync(srcPath, destPath);
+		} else {
+			fs.copyFileSync(srcPath, destPath);
+		}
+	}
+}
+
+/** Recursively copy a directory, excluding .html files. */
+function copyDirSyncExcludeHtml(src: string, dest: string): void {
+	fs.mkdirSync(dest, { recursive: true });
+	const entries = fs.readdirSync(src, { withFileTypes: true });
+	for (const entry of entries) {
+		const srcPath = path.join(src, entry.name);
+		const destPath = path.join(dest, entry.name);
+		if (entry.isDirectory()) {
+			copyDirSyncExcludeHtml(srcPath, destPath);
+		} else if (!entry.name.endsWith('.html')) {
+			fs.copyFileSync(srcPath, destPath);
+		}
 	}
 }
 
