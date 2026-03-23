@@ -156,14 +156,15 @@ These are **pre-existing** workspace cross-reference issues unrelated to increme
 
 ## Documents in This Directory
 
-| Document                                   | Description                                                                                                |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| [design.md](./design.md)                   | Original architecture and research. Written before implementation; some details superseded by phase plans. |
-| [phase-1-plan.md](./phase-1-plan.md)       | Phase 1: Content digest diffing with conservative full-rebuild fallback.                                   |
-| [phase-2-plan.md](./phase-2-plan.md)       | Phase 2: Partial dependency graph via `partialResolver` + MDX AST scanning.                                |
-| [phase-3-plan.md](./phase-3-plan.md)       | Phase 3: Skip Vite build by serializing/restoring BuildInternals.                                          |
-| [testing-results.md](./testing-results.md) | All test results across phases with timings and correctness checks.                                        |
-| [future-work.md](./future-work.md)         | Phase 4 analysis (component tracking), CI/CD integration, other improvements.                              |
+| Document                                       | Description                                                                                                |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| [design.md](./design.md)                       | Original architecture and research. Written before implementation; some details superseded by phase plans. |
+| [phase-1-plan.md](./phase-1-plan.md)           | Phase 1: Content digest diffing with conservative full-rebuild fallback.                                   |
+| [phase-2-plan.md](./phase-2-plan.md)           | Phase 2: Partial dependency graph via `partialResolver` + MDX AST scanning.                                |
+| [phase-3-plan.md](./phase-3-plan.md)           | Phase 3: Skip Vite build by serializing/restoring BuildInternals.                                          |
+| [testing-results.md](./testing-results.md)     | All test results across phases with timings and correctness checks.                                        |
+| [future-work.md](./future-work.md)             | Phase 4 analysis (component tracking), CI/CD integration, other improvements.                              |
+| [plugin-extraction.md](./plugin-extraction.md) | Analysis of extracting this as an Astro plugin. Phases 1+2 are plugin-able; Phase 3 requires the fork.     |
 
 ## Phases
 

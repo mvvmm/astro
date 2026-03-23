@@ -53,6 +53,7 @@ Detailed docs live in [`docs/incremental-build/`](./docs/incremental-build/):
 - **[Phase 3 Plan](./docs/incremental-build/phase-3-plan.md)** — Skip Vite build
 - **[Testing Results](./docs/incremental-build/testing-results.md)** — All test results with timings
 - **[Future Work](./docs/incremental-build/future-work.md)** — Phase 4 analysis, CI/CD, potential improvements
+- **[Plugin Extraction](./docs/incremental-build/plugin-extraction.md)** — Can this be an Astro plugin? (Phases 1+2 yes, Phase 3 no)
 
 ## Files Changed (Astro Fork)
 
