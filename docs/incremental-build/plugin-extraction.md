@@ -273,6 +273,34 @@ This is the most elegant option — the prerenderer already controls _which_ pag
 
 ---
 
+---
+
+## Generalization (Applied)
+
+The initial implementation hardcoded collection names `'docs'` and `'partials'`, and used a Starlight-specific `entryIdToPathname` mapping. These have been generalized into config options so the feature works for any Astro site:
+
+| Hardcoding                            | Fix                                                                               |
+| ------------------------------------- | --------------------------------------------------------------------------------- |
+| Only `docs` collection gets diffed    | `pageCollections: string[]` — list of collections to diff incrementally           |
+| Only `partials` collection is scanned | `partialCollections: string[]` — list of collections to scan for dep graph        |
+| Starlight `/index` stripping          | `entryIdToPathname` callback — configurable mapping from entry ID to URL pathname |
+
+Default values match the original behavior (`pageCollections: ['docs']`, `partialCollections: ['partials']`), so cloudflare-docs continues to work without config changes. Other sites override as needed:
+
+```ts
+// Example: blog site with route at /blog/[...slug]
+incrementalBuild: {
+  pageCollections: ['posts'],
+  partialCollections: ['snippets'],
+  entryIdToPathname: (collection, entryId) => {
+    if (collection === 'posts') return `/blog/${entryId}`;
+    return `/${entryId}`;
+  },
+}
+```
+
+---
+
 ## Recommendation
 
 **For cloudflare-docs specifically**: Keep using the fork. The ~19s builds from Phase 3 are the primary value. A plugin-only approach at ~130s isn't worth it when the fork is already working.

@@ -1293,6 +1293,45 @@ export interface AstroUserConfig<
 	 */
 	incrementalBuild?: {
 		/**
+		 * Content collection names that contain renderable pages. Entries in these
+		 * collections are diffed by digest for incremental builds — changed entries
+		 * are rebuilt, unchanged entries are copied from the previous build.
+		 *
+		 * @default ['docs']
+		 */
+		pageCollections?: string[];
+
+		/**
+		 * Content collection names that contain reusable content partials/snippets.
+		 * When `partialResolver` is configured, entries in these collections are
+		 * scanned for the dependency graph: a changed partial only triggers rebuilds
+		 * of the pages that use it.
+		 *
+		 * @default ['partials']
+		 */
+		partialCollections?: string[];
+
+		/**
+		 * Maps a content collection entry ID to its URL pathname. Used to match
+		 * dirty entries against `getStaticPaths()` output.
+		 *
+		 * Receives the collection name and entry ID, returns the pathname string
+		 * (e.g. `"/workers/get-started/guide"`).
+		 *
+		 * @default Entry ID prefixed with `/`, with trailing `/index` stripped.
+		 *
+		 * @example
+		 * ```js
+		 * // Site with blog posts at /blog/[...slug]
+		 * entryIdToPathname: (collection, entryId) => {
+		 *   if (collection === 'posts') return `/blog/${entryId}`;
+		 *   return `/${entryId}`;
+		 * }
+		 * ```
+		 */
+		entryIdToPathname?: (collection: string, entryId: string) => string;
+
+		/**
 		 * Glob patterns (relative to project root) that, if any matched file has
 		 * changed since the previous build, trigger a full rebuild instead of an
 		 * incremental one.

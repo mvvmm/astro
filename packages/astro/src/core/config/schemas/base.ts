@@ -205,6 +205,9 @@ export const AstroConfigSchema = z.object({
 		.prefault({}),
 	incrementalBuild: z
 		.object({
+			pageCollections: z.array(z.string()).optional().default(['docs']),
+			partialCollections: z.array(z.string()).optional().default(['partials']),
+			entryIdToPathname: z.function().optional(),
 			globalFiles: z.array(z.string()).optional().default(['astro.config.*', 'package.json']),
 			partialResolver: z.function().optional(),
 		})

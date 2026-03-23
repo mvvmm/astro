@@ -32,13 +32,17 @@ interface ComponentManifest {
 }
 
 interface DepMap {
-	/** partial filePath → doc entry IDs whose pages depend on it (after transitive closure) */
+	/** Format version — increment when the serialized format changes */
+	version?: number;
+	/** partial filePath → qualified page IDs ("collection:entryId") after transitive closure */
 	partialToPages: Record<string, string[]>;
 	/** partial filePath → other partial filePaths it directly renders */
 	partialToPartials: Record<string, string[]>;
 	/** filePath → digest at time of scanning (for incremental rescan) */
 	scannedDigests: Record<string, string>;
 }
+
+const DEP_MAP_VERSION = 2;
 
 const DEP_MAP_FILE = 'dep-map.json';
 
@@ -61,6 +65,14 @@ export async function computeDirtyPathnames(opts: {
 }): Promise<IncrementalBuildResult | null> {
 	const { settings, logger, previousDist } = opts;
 	const root = fileURLToPath(settings.config.root);
+
+	// Read config options with defaults
+	const pageCollections = settings.config.incrementalBuild?.pageCollections ?? ['docs'];
+	const partialCollections = settings.config.incrementalBuild?.partialCollections ?? ['partials'];
+	const entryIdToPathnameConfig = settings.config.incrementalBuild?.entryIdToPathname as
+		| ((collection: string, entryId: string) => string)
+		| undefined;
+	const entryIdToPathname = entryIdToPathnameConfig ?? defaultEntryIdToPathname;
 
 	// Resolve dist-meta/ sibling of previousDist
 	const previousDistAbs = path.resolve(root, previousDist);
@@ -174,6 +186,8 @@ export async function computeDirtyPathnames(opts: {
 				currentDataStore,
 				distMetaDir,
 				partialResolver,
+				pageCollections,
+				partialCollections,
 				logger,
 			});
 		}
@@ -190,8 +204,8 @@ export async function computeDirtyPathnames(opts: {
 
 			const prevEntries = prevDataStore.get(collectionName);
 
-			// Handle partials collection via dep map when partialResolver is configured
-			if (collectionName === 'partials' && depMap) {
+			// Handle partial collections via dep map when partialResolver is configured
+			if (partialCollections.includes(collectionName) && depMap) {
 				const changedPartialPaths = new Set<string>();
 				// Find changed/new partials
 				for (const [entryId, entry] of currentEntries) {
@@ -212,9 +226,12 @@ export async function computeDirtyPathnames(opts: {
 					// Expand through transitive closure
 					const allAffected = expandTransitive(changedPartialPaths, depMap);
 					for (const partialPath of allAffected) {
-						const pageEntryIds = depMap.partialToPages[partialPath] ?? [];
-						for (const pageEntryId of pageEntryIds) {
-							dirtyPathnames.add(entryIdToPathname(pageEntryId));
+						const qualifiedPageIds = depMap.partialToPages[partialPath] ?? [];
+						for (const qualifiedId of qualifiedPageIds) {
+							const sepIdx = qualifiedId.indexOf(':');
+							const col = sepIdx >= 0 ? qualifiedId.slice(0, sepIdx) : pageCollections[0];
+							const eid = sepIdx >= 0 ? qualifiedId.slice(sepIdx + 1) : qualifiedId;
+							dirtyPathnames.add(entryIdToPathname(col, eid));
 						}
 					}
 					logger.info(
@@ -225,12 +242,12 @@ export async function computeDirtyPathnames(opts: {
 				continue;
 			}
 
-			// For docs collection: diff entry-by-entry
-			if (collectionName === 'docs') {
+			// For page collections: diff entry-by-entry
+			if (pageCollections.includes(collectionName)) {
 				if (!prevEntries) {
 					// Entire collection is new — all entries are dirty
 					for (const [entryId] of currentEntries) {
-						dirtyPathnames.add(entryIdToPathname(entryId));
+						dirtyPathnames.add(entryIdToPathname(collectionName, entryId));
 					}
 					continue;
 				}
@@ -239,16 +256,16 @@ export async function computeDirtyPathnames(opts: {
 				for (const [entryId, entry] of currentEntries) {
 					const prevEntry = prevEntries.get(entryId);
 					if (!prevEntry) {
-						dirtyPathnames.add(entryIdToPathname(entryId));
+						dirtyPathnames.add(entryIdToPathname(collectionName, entryId));
 					} else if (entry.digest !== prevEntry.digest) {
-						dirtyPathnames.add(entryIdToPathname(entryId));
+						dirtyPathnames.add(entryIdToPathname(collectionName, entryId));
 					}
 				}
 
 				// Check for deleted entries
 				for (const [entryId] of prevEntries) {
 					if (!currentEntries.has(entryId)) {
-						cleanupPathnames.add(entryIdToPathname(entryId));
+						cleanupPathnames.add(entryIdToPathname(collectionName, entryId));
 					}
 				}
 				continue;
@@ -265,15 +282,18 @@ export async function computeDirtyPathnames(opts: {
 		for (const [collectionName] of prevDataStore) {
 			if (collectionName.startsWith('meta:')) continue;
 			if (!currentDataStore.has(collectionName)) {
-				if (collectionName === 'docs') {
+				if (pageCollections.includes(collectionName)) {
 					const prevEntries = prevDataStore.get(collectionName)!;
 					for (const [entryId] of prevEntries) {
-						cleanupPathnames.add(entryIdToPathname(entryId));
+						cleanupPathnames.add(entryIdToPathname(collectionName, entryId));
 					}
-				} else if (collectionName === 'partials' && depMap) {
-					// Partials collection deleted — all pages that used partials are dirty
+				} else if (partialCollections.includes(collectionName) && depMap) {
+					// Partial collection deleted — all pages that used partials are dirty
 					// This is an unusual case; treat as full rebuild for safety
-					logger.info('build', 'Incremental: partials collection deleted — full rebuild.');
+					logger.info(
+						'build',
+						`Incremental: collection "${collectionName}" deleted — full rebuild.`,
+					);
 					return null;
 				} else {
 					logger.info(
@@ -411,11 +431,15 @@ export async function persistBuildMetadata(opts: {
 			JSON.parse(currentDataStoreRaw),
 		);
 		const distMetaDir = path.join(path.dirname(outDirPath), 'dist-meta');
+		const pageCollections = settings.config.incrementalBuild?.pageCollections ?? ['docs'];
+		const partialCollections = settings.config.incrementalBuild?.partialCollections ?? ['partials'];
 		depMap = await buildDependencyMap({
 			root,
 			currentDataStore,
 			distMetaDir,
 			partialResolver,
+			pageCollections,
+			partialCollections,
 			logger,
 		});
 	}
@@ -686,25 +710,42 @@ async function buildDependencyMap(opts: {
 	currentDataStore: Map<string, Map<string, DataEntry>>;
 	distMetaDir: string;
 	partialResolver: (name: string, props: Record<string, string>) => string | null;
+	pageCollections: string[];
+	partialCollections: string[];
 	logger: Logger;
 }): Promise<DepMap> {
-	const { root, currentDataStore, distMetaDir, partialResolver, logger } = opts;
+	const {
+		root,
+		currentDataStore,
+		distMetaDir,
+		partialResolver,
+		pageCollections,
+		partialCollections,
+		logger,
+	} = opts;
+	const pageColSet = new Set(pageCollections);
+	const partialColSet = new Set(partialCollections);
 
-	// Load previous dep map (if it exists)
+	// Load previous dep map (if it exists and version matches)
 	let prevDepMap: DepMap | null = null;
 	const depMapPath = path.join(distMetaDir, DEP_MAP_FILE);
 	if (fs.existsSync(depMapPath)) {
 		try {
-			prevDepMap = JSON.parse(fs.readFileSync(depMapPath, 'utf-8'));
+			const parsed = JSON.parse(fs.readFileSync(depMapPath, 'utf-8'));
+			if (parsed.version === DEP_MAP_VERSION) {
+				prevDepMap = parsed;
+			} else {
+				logger.info('build', 'Incremental: dep-map format changed, doing full scan.');
+			}
 		} catch {
 			logger.debug('build', 'Incremental: could not parse previous dep-map.json, doing full scan.');
 		}
 	}
 
-	// Collect all MDX files from docs and partials collections with their digests
+	// Collect all MDX files from page and partial collections with their digests
 	const filesToScan: { filePath: string; digest: string; collection: string; entryId: string }[] =
 		[];
-	for (const collectionName of ['docs', 'partials']) {
+	for (const collectionName of [...pageCollections, ...partialCollections]) {
 		const entries = currentDataStore.get(collectionName);
 		if (!entries) continue;
 		for (const [entryId, entry] of entries) {
@@ -734,14 +775,15 @@ async function buildDependencyMap(opts: {
 		if (prevDepMap?.scannedDigests[filePath] === digest) {
 			// Digest unchanged — reconstruct forward deps from the previous dep map
 			const deps: string[] = [];
-			if (collection === 'docs') {
+			if (pageColSet.has(collection)) {
 				// Find which partials this page referenced in the old map
+				const qualifiedId = `${collection}:${entryId}`;
 				for (const [partialPath, pageIds] of Object.entries(prevDepMap.partialToPages)) {
-					if (pageIds.includes(entryId)) {
+					if (pageIds.includes(qualifiedId)) {
 						deps.push(partialPath);
 					}
 				}
-			} else if (collection === 'partials') {
+			} else if (partialColSet.has(collection)) {
 				// Get partial-to-partial deps from old map
 				const p2p = prevDepMap.partialToPartials[filePath];
 				if (p2p) deps.push(...p2p);
@@ -780,15 +822,17 @@ async function buildDependencyMap(opts: {
 		const deps = forwardDeps.get(filePath);
 		if (!deps) continue;
 
-		if (collection === 'docs') {
-			// This is a doc page → its deps are partial file paths
+		if (pageColSet.has(collection)) {
+			// This is a page → its deps are partial file paths
+			// Store as "collection:entryId" so we can reconstruct at expansion time
+			const qualifiedId = `${collection}:${entryId}`;
 			for (const partialPath of deps) {
 				if (!directPartialToPages[partialPath]) {
 					directPartialToPages[partialPath] = new Set();
 				}
-				directPartialToPages[partialPath].add(entryId);
+				directPartialToPages[partialPath].add(qualifiedId);
 			}
-		} else if (collection === 'partials') {
+		} else if (partialColSet.has(collection)) {
 			// This is a partial → its deps are other partial file paths
 			partialToPartials[filePath] = deps;
 		}
@@ -843,6 +887,7 @@ async function buildDependencyMap(opts: {
 	}
 
 	return {
+		version: DEP_MAP_VERSION,
 		partialToPages: finalPartialToPages,
 		partialToPartials,
 		scannedDigests,
@@ -990,12 +1035,12 @@ async function computeComponentManifest(
 }
 
 /**
- * Map a docs collection entry ID to its URL pathname.
+ * Default mapping from a content collection entry ID to its URL pathname.
  *
  * For Starlight sites: entryId "workers/get-started/guide" → "/workers/get-started/guide"
  * For root index: entryId "" → "/"
  */
-function entryIdToPathname(entryId: string): string {
+function defaultEntryIdToPathname(_collection: string, entryId: string): string {
 	if (entryId === '' || entryId === 'index') return '/';
 	// Strip trailing /index (Starlight normalizes these)
 	const normalized = entryId.endsWith('/index') ? entryId.slice(0, -6) : entryId;
