@@ -145,6 +145,8 @@
     "js-yaml": "^4.1.1",
     "magic-string": "^0.30.21",
     "magicast": "^0.5.2",
+    "mdast-util-from-markdown": "^2.0.0",
+    "micromark-extension-mdxjs": "^3.0.0",
     "mrmime": "^2.0.1",
     "neotraverse": "^0.6.18",
     "obug": "^2.1.1",

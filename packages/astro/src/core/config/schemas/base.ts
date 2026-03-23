@@ -203,6 +203,16 @@ export const AstroConfigSchema = z.object({
 			concurrency: z.number().min(1).optional().default(ASTRO_CONFIG_DEFAULTS.build.concurrency),
 		})
 		.prefault({}),
+	incrementalBuild: z
+		.object({
+			pageCollections: z.array(z.string()).optional().default(['docs']),
+			partialCollections: z.array(z.string()).optional().default(['partials']),
+			entryIdToPathname: z.function().optional(),
+			globalFiles: z.array(z.string()).optional().default(['astro.config.*', 'package.json']),
+			partialResolver: z.function().optional(),
+		})
+		.optional()
+		.prefault({}),
 	server: z.preprocess(
 		// preprocess
 		// NOTE: Uses the "error" command here because this is overwritten by the

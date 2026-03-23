@@ -594,6 +594,12 @@ importers:
       magicast:
         specifier: ^0.5.2
         version: 0.5.2
+      mdast-util-from-markdown:
+        specifier: ^2.0.0
+        version: 2.0.2
+      micromark-extension-mdxjs:
+        specifier: ^3.0.0
+        version: 3.0.0
       mrmime:
         specifier: ^2.0.1
         version: 2.0.1

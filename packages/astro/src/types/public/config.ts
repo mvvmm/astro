@@ -1288,6 +1288,77 @@ export interface AstroUserConfig<
 	};
 
 	/**
+	 * Configuration for incremental builds. When used with the `--previous-dist`
+	 * CLI flag, Astro will only rebuild pages whose source has changed.
+	 */
+	incrementalBuild?: {
+		/**
+		 * Content collection names that contain renderable pages. Entries in these
+		 * collections are diffed by digest for incremental builds — changed entries
+		 * are rebuilt, unchanged entries are copied from the previous build.
+		 *
+		 * @default ['docs']
+		 */
+		pageCollections?: string[];
+
+		/**
+		 * Content collection names that contain reusable content partials/snippets.
+		 * When `partialResolver` is configured, entries in these collections are
+		 * scanned for the dependency graph: a changed partial only triggers rebuilds
+		 * of the pages that use it.
+		 *
+		 * @default ['partials']
+		 */
+		partialCollections?: string[];
+
+		/**
+		 * Maps a content collection entry ID to its URL pathname. Used to match
+		 * dirty entries against `getStaticPaths()` output.
+		 *
+		 * Receives the collection name and entry ID, returns the pathname string
+		 * (e.g. `"/workers/get-started/guide"`).
+		 *
+		 * @default Entry ID prefixed with `/`, with trailing `/index` stripped.
+		 *
+		 * @example
+		 * ```js
+		 * // Site with blog posts at /blog/[...slug]
+		 * entryIdToPathname: (collection, entryId) => {
+		 *   if (collection === 'posts') return `/blog/${entryId}`;
+		 *   return `/${entryId}`;
+		 * }
+		 * ```
+		 */
+		entryIdToPathname?: (collection: string, entryId: string) => string;
+
+		/**
+		 * Glob patterns (relative to project root) that, if any matched file has
+		 * changed since the previous build, trigger a full rebuild instead of an
+		 * incremental one.
+		 *
+		 * @default ['astro.config.*', 'package.json']
+		 */
+		globalFiles?: string[];
+
+		/**
+		 * A function that inspects a JSX node in an MDX file and returns the
+		 * content file path it depends on, or null if the node is not a content
+		 * reference. Used to build the partial-to-page reverse dependency map.
+		 *
+		 * @example
+		 * ```js
+		 * partialResolver: (name, props) => {
+		 *   if (name === 'Render' && props.file && props.product) {
+		 *     return `src/content/partials/${props.product}/${props.file}.mdx`;
+		 *   }
+		 *   return null;
+		 * }
+		 * ```
+		 */
+		partialResolver?: (jsxNodeName: string, jsxProps: Record<string, string>) => string | null;
+	};
+
+	/**
 	 * @docs
 	 * @kind heading
 	 * @name Server Options
@@ -3048,6 +3119,18 @@ export interface AstroInlineOnlyConfig {
 	 * Clear the content layer cache, forcing a rebuild of all content entries.
 	 */
 	force?: boolean;
+	/**
+	 * Path to a previous build's output directory. When provided, Astro will
+	 * perform an incremental build: only pages whose source has changed since
+	 * the previous build will be rebuilt. All other pages will be copied from
+	 * this directory.
+	 *
+	 * The path can be absolute or relative to the project root.
+	 *
+	 * Build metadata (data store snapshot, component hashes) is read from a
+	 * `dist-meta/` sibling directory alongside the provided path.
+	 */
+	previousDist?: string;
 	/**
 	 * @internal for testing only, use `logLevel` instead.
 	 */

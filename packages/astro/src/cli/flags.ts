@@ -14,6 +14,7 @@ export function flagsToAstroInlineConfig(flags: Flags): AstroInlineConfig {
 		mode: typeof flags.mode === 'string' ? flags.mode : undefined,
 		logLevel: flags.verbose ? 'debug' : flags.silent ? 'silent' : undefined,
 		force: flags.force ? true : undefined,
+		previousDist: typeof flags['previous-dist'] === 'string' ? flags['previous-dist'] : undefined,
 
 		// Astro user configs
 		root: typeof flags.root === 'string' ? flags.root : undefined,
