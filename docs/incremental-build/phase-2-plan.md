@@ -1,6 +1,6 @@
 # Phase 2: Partial Dependency Graph
 
-**Status**: Planning
+**Status**: Implemented
 **Prerequisite**: [Phase 1](./phase-1-plan.md) (implemented), [design.md](./design.md)
 
 ---
